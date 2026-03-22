@@ -3,7 +3,12 @@ package org.dcache.nearline.cta;
 import static com.google.common.base.Preconditions.checkArgument;
 
 import ch.cern.cta.rpc.CtaRpcGrpc;
+import ch.cern.cta.rpc.CtaRpcStreamGrpc;
+import ch.cern.cta.rpc.Request;
 import ch.cern.cta.rpc.Response;
+import ch.cern.cta.rpc.StreamResponse;
+import cta.admin.CtaAdmin;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Splitter;
 import com.google.common.base.Throwables;
@@ -28,7 +33,9 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.util.Map;
+import java.util.Iterator;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -57,6 +64,7 @@ import org.slf4j.LoggerFactory;
 public class CtaNearlineStorage implements NearlineStorage {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(CtaNearlineStorage.class);
+    private final KerberosContext kerberosContext;
 
     public static final String CTA_INSTANCE = "cta-instance-name";
     public static final String CTA_ENDPOINT = "cta-frontend-addr";
@@ -68,10 +76,11 @@ public class CtaNearlineStorage implements NearlineStorage {
     public static final String IO_PORT = "io-port";
     public static final String CTA_REQUEST_TIMEOUT = "cta-frontend-timeout";
     public static final String DIO = "use-dio";
+    public static final String KRB5_KEYTAB = "krb5-keytab";
+    public static final String KRB5_PRINCIPAL = "krb5-principal";
 
     protected final String type;
     protected final String name;
-
 
     /**
      * User name associated with the requests on the CTA side.
@@ -97,6 +106,7 @@ public class CtaNearlineStorage implements NearlineStorage {
      * CTA gRPC frontend service.
      */
     private CtaRpcBlockingStub cta;
+    private CtaRpcStreamGrpc.CtaRpcStreamBlockingStub ctaAdmin;
 
     /**
      * Data mover used to read or write files by CTA.
@@ -142,6 +152,21 @@ public class CtaNearlineStorage implements NearlineStorage {
      * Use direct IO for data mover.
      */
     private boolean dio;
+
+    /**
+     * Path to the Kerberos keytab file used for CTA-Admin authentication
+     */
+    private String krb5Keytab;
+
+    /**
+     * Kerberos principal used for CTA-Admin authentication
+     */
+    private String krb5Principal;
+
+    /**
+     * Enable Kerberos authentication, when ok krb5Keytab + krb5Principal
+     */
+    private boolean useKrb5Auth;
 
 
     /**
@@ -214,11 +239,24 @@ public class CtaNearlineStorage implements NearlineStorage {
                     continue;
                 }
 
+                // check if file is already archived in CTA before creating a new archive entry
+                // like this: cta-admin tf ls --instance <ctaInstanceName> --dfid <pnfsId>
+                String pnfsId = fr.getFileAttributes().getPnfsId().toString();
+                Optional<Long> existingArchiveId = queryExistingArchiveId(pnfsId);
+
+                if (existingArchiveId.isPresent()) {
+                    LOGGER.info("{}: File {} already archived in CTA (archiveId={}), skipping flush",
+                        fr.getId(), pnfsId, existingArchiveId.get());
+                    fr.completed(Set.of(createHsmUri(fr.getFileAttributes(), existingArchiveId.get())));
+                    continue;
+                }
+
+                // file not yet in CTA, so do the normal flush path
                 var createRequest = ctaRequestFactory.getCreateRequest(fr.getFileAttributes());
                 var createResponse =  withStats(Action.GET_ARCHIVE_ID, () -> cta.withDeadline(getRequestDeadline()).create(createRequest));
-                LOGGER.info("{}: Create new archive id {} for {}",  fr.getId(),
-                        createResponse.getArchiveFileId(),
-                        fr.getFileAttributes().getPnfsId()
+                LOGGER.info("{}: Create new archive id {} for {}", fr.getId(),
+                    createResponse.getArchiveFileId(),
+                    fr.getFileAttributes().getPnfsId()
                 );
 
                 submitFlush(fr, Long.parseLong(createResponse.getArchiveFileId()));
@@ -230,6 +268,53 @@ public class CtaNearlineStorage implements NearlineStorage {
             }
         }
 
+    }
+
+    /**
+     * Check if file is already archived in CTA
+     */
+    private Optional<Long> queryExistingArchiveId(String pnfsId) {
+
+        var request = Request.newBuilder()
+                .setAdmincmd(CtaAdmin.AdminCmd.newBuilder()
+                        .setClientVersion(CtaNearlineStorageProvider.VERSION)
+                        .setCmd(CtaAdmin.AdminCmd.Cmd.CMD_TAPEFILE)
+                        .setSubcmd(CtaAdmin.AdminCmd.SubCmd.SUBCMD_LS)
+                        .addOptionStr(CtaAdmin.OptionString.newBuilder()
+                                .setKey(CtaAdmin.OptionString.Key.DISK_INSTANCE)
+                                .setValue(instanceName)
+                                .build())
+                        .addOptionStr(CtaAdmin.OptionString.newBuilder()
+                                .setKey(CtaAdmin.OptionString.Key.DISK_FILE_ID)
+                                .setValue(pnfsId)
+                                .build())
+                        .build())
+                .build();
+
+        try {
+            Iterator<StreamResponse> responses = ctaAdmin
+                    .withDeadline(getRequestDeadline())
+                    .genericAdminStream(request);
+
+            while (responses.hasNext()) {
+                var sr = responses.next();
+                if (sr.hasData() && sr.getData().hasTflsItem()) {
+                    var item = sr.getData().getTflsItem();
+                    long archiveId = item.getAf().getArchiveId();
+                    LOGGER.debug("tf ls: pnfsId={} already in CTA, archiveId={}, vid={}",
+                            pnfsId, archiveId, item.getTf().getVid());
+                    return Optional.of(archiveId);
+                }
+            }
+        } catch (StatusRuntimeException e) {
+            if (e.getStatus().getCode() == Status.Code.NOT_FOUND) {
+                LOGGER.debug("tf ls: pnfsId={} not yet in CTA", pnfsId);
+            } else {
+                LOGGER.warn("tf ls check failed for pnfsId={}: {} - proceeding with normal flush",
+                        pnfsId, e.getStatus());
+            }
+        }
+        return Optional.empty();
     }
 
     /**
@@ -485,6 +570,14 @@ public class CtaNearlineStorage implements NearlineStorage {
         }
 
         dio = Boolean.parseBoolean(properties.getOrDefault(DIO, "false"));
+
+        // Kerberos options
+        useKrb5Auth = false;
+        String krb5Keytab = properties.get(KRB5_KEYTAB);
+        String krb5Principal = properties.get(KRB5_PRINCIPAL);
+        if (krb5Keytab != null && krb5Principal != null) {
+            useKrb5Auth = true;
+        }
     }
 
     @Override
@@ -521,7 +614,24 @@ public class CtaNearlineStorage implements NearlineStorage {
                     new ThreadFactoryBuilder().setNameFormat("cta-grpc-callback-runner-%d").build()))
               .build();
 
+        if (useKrb5Auth) {
+            kerberosContext = new KerberosContext(krb5Keytab, krb5Principal);
+            if (kerberosContext.isEnabled()) {
+                try {
+                    kerberosContext.login();
+                    LOGGER.info("Kerberos login successful for principal {}", krb5Principal);
+                } catch (LoginException e) {
+                    throw new IllegalArgumentException(
+                          "Failed to initialize Kerberos authentication for principal "
+                                + krb5Principal + " using keytab " + krb5Keytab, e);
+                }
+            } else {
+                LOGGER.info("Kerberos authentication disabled for CTA plugin");
+            }
+        }
+
         cta = CtaRpcGrpc.newBlockingStub(channel);
+        ctaAdmin = CtaRpcStreamGrpc.newBlockingStub(channel);
         channel.notifyWhenStateChanged(ConnectivityState.CONNECTING, () -> {
                     LOGGER.info("Connected to CTA frontend");
                 }
@@ -573,6 +683,10 @@ public class CtaNearlineStorage implements NearlineStorage {
 
     private URI createZeroFileUri(FileAttributes attrs) {
         return URI.create(type + "://" + name + "/" + attrs.getPnfsId() + "?archiveid=*");
+    }
+
+    private URI createHsmUri(FileAttributes attrs, long archiveId) {
+        return URI.create(type + "://" + name + "/" + attrs.getPnfsId() + "?archiveid=" + archiveId);
     }
 
     @Command(name="show requests", hint = "show pending requests",

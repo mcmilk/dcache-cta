@@ -27,28 +27,36 @@ rpmbuild -ba --define "_topdir `pwd`/rpmbuild" target/SPECS/dcache-cta.spec
 
 ## Using the plugin with dCache
 
-To use this plugin with dCache, place the directory containing this
-file in /usr/local/share/dcache/plugins/ on a dCache pool. Restart
-the pool to load the plugin.
+To use this plugin with dCache, place the directory containing this file in
+/usr/local/share/dcache/plugins/ on a dCache pool. Restart the pool to load
+the plugin.
 
 To verify that the plugin is loaded, navigate to the pool in the dCache admin
 shell and issue the command:
 
-    hsm show providers
+```
+hsm show providers
+```
 
 The plugin should be listed as **dcache-cta**.
 
 To activate the plugin, create an HSM instance using:
 
-    hsm create osm name dcache-cta [-key=value]...
+```
+hsm create hsmType hsmName dcache-cta [-key=value]...
+```
 
 example:
 
-    hsm create osm cta dcache-cta -cta-user=userA \
-         -cta-group=groupA -cta-instance-name=instanceA \
-         -cta-frontend-addr=cta-forntend-host1:17017,cta-forntend-host2:17017 \
-         -cta-use-tls=true \
-         -io-endpoint=a.b.c.d -io-port=1094
+```
+hsm create cta cta dcache-cta \
+     -cta-user=userA \
+     -cta-group=groupA \
+     -cta-instance-name=instanceA \
+     -cta-frontend-addr=cta-forntend-host1:17017,cta-forntend-host2:17017 \
+     -cta-use-tls=true \
+     -io-endpoint=a.b.c.d -io-port=1094
+```
 
 The dCache files stored in CTA will have hsm uri in form
 ```
@@ -58,7 +66,7 @@ Where `id` represents the CTA internal `archiveId`
 
 for example:
 ```
-osm://cta/00001D43C0C086CA459298C634D67F68AB6B?archiveid=8402
+cta://cta/00001D43C0C086CA459298C634D67F68AB6B?archiveid=8402
 ```
 
 In the CTA catalog the dCache's `pnfsid`s are referenced as `disk_file_id` field:
@@ -86,39 +94,62 @@ collocation_hint    |
 
 ## dCache pool configuration
 
-As CTA has its own scheduler and flush/restore queue the dCache pools should be configured to
-submit as much request as possible. Thus grouping and collecting request on the pool side should
-be disabled:
+As CTA has its own scheduler and flush/restore queue the dCache pools should
+be configured to submit as much request as possible. Thus grouping and
+collecting request on the pool side should be disabled:
 
 ```
 queue define class -expire=0 -pending=0 -total=0 -open <hsmType> *
 ```
 
-### The available configuration options:
+### The required configuration options:
 
-| Name                     | Description                                                    | required | default    |
-|:-------------------------|:---------------------------------------------------------------|---------:|------------|
-| cta-instance-name        | The dCache instance name configured in CTA                     |      yes | -          |
-| cta-frontend-addr        | A comma separated list of  CTA `cta-dcache` endpoints          |      yes | -          |
-| cta-user                 | The dCache instance associated user in CTA                     |      yes | -          |
-| cta-group                | The dCache instance associated group in CTA                    |      yes | -          |
-| cta-ca-chain             | The path to CA root chain for use with TLS                     |       no | -          |
-| cta-use-tls              | A switch (true/false) to enable TLS for CTA control connection |       no | `false`    |
-| cta-frontend-timeout     | How log dCache waits in seconds for CTA frontend to reply      |       no | 30         |
-| io-endpoint              | The hostname or IP offered by dCache for IO by CTA             |       no | `hostname` |
-| io-port                  | The TCP port offered by dCache for IO by CTA                   |       no | -          |
-| use-dio                  | Use Direct-I/O                                                 |       no | `false`    |
-| restore-success-on-close | **obsolete**                                                   |        - | -          |
+| Name                 | Description                                           | default    |
+|:---------------------|:-----------------------------------------------------:|------------|
+| cta-instance-name    | The dCache instance name configured in CTA            | -          |
+| cta-frontend-addr    | A comma separated list of CTA `cta-dcache` endpoints  | -          |
+| cta-user             | The user associated with the dCache instance in CTA   | -          |
+| cta-group            | The group associated with the dCache instance in CTA  | -          |
+
+### The optional configuration options:
+
+| Name                 | Description                                               | default    |
+|:---------------------|:---------------------------------------------------------:|------------|
+| cta-ca-chain         | The path to CA root chain for use with TLS                | -          |
+| cta-use-tls          | Enable or disable TLS for the CTA control connection      | `false`    |
+| cta-frontend-timeout | Timeout in seconds for replies from the CTA frontend      | 30         |
+| io-endpoint          | Hostname or IP address offered by dCache for I/O by CTA   | `hostname` |
+| io-port              | TCP port offered by dCache for I/O by CTA                 | -          |
+| use-dio              | Enable or disable Direct I/O                              | `false`    |
+| cta-pre-hook         | Path to script for checks before flush/stage/remove       | -          |
+| cta-post-hook        | Path to script for checks after flush/stage/remove        | -          |
+| cta-check-pnfsid     | Check if file already exists in CTA before flush          | `false`    |
+| krb5-keytab          | Check whether the file already exists in CTA before flush | -          |
+| krb5-principal       | Kerberos principal used for CTA authentication            | -          |
+
+### The pre-hooks and post-hooks
+
+XXX - TODO
+
+| Exit-Code | Bedeutung  | Verhalten im Plugin                    |
+| --------- | ---------- | -------------------------------------- |
+| 0         | OK         | weiter mit Flush                       |
+| 1         | Fehler     | Flush abbrechen, permanenter Fehler    |
+| 2         | Warten     | Flush zurückstellen, später retry      |
+| 3         | Skip       | diese Datei überspringen (kein Fehler) |
+| >= 10     | reserviert | für spätere Erweiterungen              |
 
 ### Load balancing and failover
 
-If multiple `cta-frontend-addr` are provided, the driver will try to connect to all endpoints and use `round-robin`
-strategy to distribute the requests. If TLS is used, then all endpoints names should be present in SAN field of the
+If multiple `cta-frontend-addr` are provided, the driver will try to connect
+to all endpoints and use `round-robin` strategy to distribute the requests. If
+TLS is used, then all endpoints names should be present in SAN field of the
 certificate.
 
 ## Compatibility with CTA
 
-The driver is compatible with all dCache versions staring 7.2. The compatibility CTA versions are:
+The driver is compatible with all dCache versions staring 7.2. The
+compatibility CTA versions are:
 
 | CTA Version              | dcache-cta version |
 |:-------------------------|:-------------------|
@@ -128,4 +159,5 @@ The driver is compatible with all dCache versions staring 7.2. The compatibility
 
 ## Acknowledgements
 
-This driver is based and inspired by `cta-communicator` by _Lea Morschel_ and  [`sapphire`](https://github.com/dCache/sapphire) by _Svenja Meyer_
+This driver is based and inspired by `cta-communicator` by _Lea Morschel_ and
+[`sapphire`](https://github.com/dCache/sapphire) by _Svenja Meyer_.
