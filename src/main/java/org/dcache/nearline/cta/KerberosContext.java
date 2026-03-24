@@ -30,10 +30,6 @@ public class KerberosContext {
         this.principal = principal;
     }
 
-    public boolean isEnabled() {
-        return !Strings.isNullOrEmpty(keytab) && !Strings.isNullOrEmpty(principal);
-    }
-
     public void login() throws LoginException {
         synchronized (lock) {
             loginContext = new LoginContext("cta-kerberos", null, (CallbackHandler) null,
