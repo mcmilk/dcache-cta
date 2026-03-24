@@ -1,4 +1,4 @@
-package org.dcache.cta;
+package org.dcache.nearline.cta;
 
 import com.google.common.base.Strings;
 
